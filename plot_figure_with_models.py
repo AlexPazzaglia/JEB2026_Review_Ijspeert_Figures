@@ -80,8 +80,8 @@ AXIS_TICK_END   = 0.90
 
 FIGSIZE         = (12.2, 7.6)
 DPI             = 160
-X_LIMITS        = (0.0, 12.9)
-Y_LIMITS        = (-0.60, 6.6)
+X_LIMITS        = (0.0, 14.10)
+Y_LIMITS        = (-0.80, 7.10)
 
 
 def clip_01(value: float) -> float:
@@ -146,6 +146,27 @@ NDOF_TICKS = [
     (1.00, "50+"),
 ]
 
+# Categorical equivalences. These are used only to snap models to the existing
+# original ticks; no new visible ticks are added.
+CONTROLLER_LEVEL_TO_COORD = {
+    "No controller"               : 0.00,
+    "Open-loop / FSM / oscillator": 0.25,
+    "Rate / leaky / CPG neural"   : 0.50,
+    "ANN / RL / torque policy"    : 0.50,
+    "Integrate-and-fire"          : 0.75,
+    "Hodgkin-Huxley"              : 1.00,
+}
+
+ACTUATOR_LEVEL_TO_COORD = {
+    "No actuator"               : 0.00,
+    "Servomotor / position"     : 0.25,
+    "DC motor / PD"             : 0.25,
+    "Torque control"            : 0.50,
+    "Ekeberg muscle"            : 0.75,
+    "Spring-damper muscle-like" : 0.75,
+    "Hill muscle"               : 1.00,
+}
+
 
 # =============================================================================
 # Data loading
@@ -165,7 +186,13 @@ def to_float(value, default: float = 0.0) -> float:
 
 
 def load_models(path: Path = MODEL_XLSX) -> list[dict]:
-    """Load model coordinates from the Models sheet."""
+    """Load model coordinates from the Models sheet.
+
+    Controller and actuator are discrete variables. Therefore, their plotted
+    positions are derived from controller_level and actuator_level and snapped
+    to the existing original ticks. The editable coordinate columns remain in
+    the workbook for transparency, but they do not create extra ticks.
+    """
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb["Models"]
 
@@ -180,18 +207,32 @@ def load_models(path: Path = MODEL_XLSX) -> list[dict]:
         if not to_bool(row.get("include_in_plot", "yes")):
             continue
 
+        controller_level = str(row.get("controller_level", ""))
+        actuator_level   = str(row.get("actuator_level", ""))
+
+        controller_coord = CONTROLLER_LEVEL_TO_COORD.get(
+            controller_level,
+            to_float(row.get("controller_coord")),
+        )
+        actuator_coord = ACTUATOR_LEVEL_TO_COORD.get(
+            actuator_level,
+            to_float(row.get("actuator_coord")),
+        )
+
         color = ROBOT_COLOR if row.get("plot_color") == "red" else MODEL_COLOR
         models.append(
             {
-                "label"       : str(row["plot_label"]),
-                "is_robot"    : to_bool(row["is_robot"]),
-                "color"       : color,
-                "controller"  : to_float(row["controller_coord"]),
-                "actuator"    : to_float(row["actuator_coord"]),
-                "ndof"        : to_float(row["ndof_coord"]),
-                "environment" : to_float(row["environment_coord"]),
-                "label_dx"    : to_float(row.get("label_dx"), 0.15),
-                "label_dy"    : to_float(row.get("label_dy"), 0.20),
+                "label"            : str(row["plot_label"]),
+                "controller_level" : controller_level,
+                "actuator_level"   : actuator_level,
+                "is_robot"         : to_bool(row["is_robot"]),
+                "color"            : color,
+                "controller"       : controller_coord,
+                "actuator"         : actuator_coord,
+                "ndof"             : to_float(row["ndof_coord"]),
+                "environment"      : to_float(row["environment_coord"]),
+                "label_dx"         : to_float(row.get("label_dx"), 0.15),
+                "label_dy"         : to_float(row.get("label_dy"), 0.20),
             }
         )
 
@@ -337,55 +378,106 @@ def draw_sphere(
 # Models and projections
 # =============================================================================
 
-def add_overlap_offsets(
-    entries: list[dict],
-    controller_offset: float = 0.050,
-    actuator_offset: float = 0.030,
-) -> list[dict]:
-    copied = [entry.copy() for entry in entries]
+def add_overlap_offsets(entries: list[dict]) -> list[dict]:
+    """Return entries unchanged.
 
-    coord_groups = defaultdict(list)
-    for index, entry in enumerate(copied):
-        key = (round(entry["controller"], 3), round(entry["actuator"], 3))
-        coord_groups[key].append(index)
-
-    for indices in coord_groups.values():
-        jitters = [0.0] if len(indices) == 1 else np.linspace(-controller_offset, controller_offset, len(indices))
-        for index, jitter in zip(indices, jitters):
-            copied[index]["controller_jitter"] = float(jitter)
-
-    actuator_groups = defaultdict(list)
-    for index, entry in enumerate(copied):
-        actuator_groups[round(entry["actuator"], 3)].append(index)
-
-    for indices in actuator_groups.values():
-        jitters = [0.0] if len(indices) == 1 else np.linspace(-actuator_offset, actuator_offset, len(indices))
-        for index, jitter in zip(indices, jitters):
-            copied[index]["actuator_axis_jitter"] = float(jitter)
-
-    return copied
+    Controller and actuator are discrete dimensions. Models sharing the same
+    actuator type must therefore sit on the same actuator coordinate. Label
+    overlap is handled only by moving text labels, not by jittering model data.
+    """
+    return [entry.copy() for entry in entries]
 
 
-def draw_model(ax, entry: dict) -> None:
+def data_delta_from_pixels(ax, dx: float, dy: float) -> np.ndarray:
+    """Convert a display-space shift in pixels into data coordinates."""
+    inv = ax.transData.inverted()
+    p0 = inv.transform((0, 0))
+    p1 = inv.transform((dx, dy))
+    return p1 - p0
+
+
+def relax_text_labels(
+    fig,
+    ax,
+    texts: list,
+    iterations: int = 220,
+    step_px: float = 6.0,
+) -> None:
+    """Iteratively separate overlapping model labels.
+
+    The model coordinates and projections are not moved.
+    """
+    if not texts:
+        return
+
+    for _ in range(iterations):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        moved = False
+
+        boxes = [text.get_window_extent(renderer=renderer).expanded(1.06, 1.12)
+                 for text in texts]
+
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                if not boxes[i].overlaps(boxes[j]):
+                    continue
+
+                ci = boxes[i].get_points().mean(axis=0)
+                cj = boxes[j].get_points().mean(axis=0)
+                direction = ci - cj
+                norm = np.linalg.norm(direction)
+
+                if norm == 0:
+                    direction = np.array([0.0, 1.0])
+                else:
+                    direction = direction / norm
+
+                direction = direction + np.array([0.18, 0.10])
+                norm = np.linalg.norm(direction)
+                direction = direction / norm if norm else direction
+
+                delta = data_delta_from_pixels(
+                    ax,
+                    step_px * direction[0],
+                    step_px * direction[1],
+                )
+
+                xi, yi = texts[i].get_position()
+                xj, yj = texts[j].get_position()
+
+                texts[i].set_position((xi + delta[0], yi + delta[1]))
+                texts[j].set_position((xj - delta[0], yj - delta[1]))
+
+                moved = True
+
+        if not moved:
+            break
+
+
+def draw_model(ax, entry: dict):
     """Draw one model and exactly three horizontal projections."""
-    controller = axis_pos(entry["controller"] + entry.get("controller_jitter", 0.0))
+    # Controller and actuator snap exactly to original discrete tick coordinates.
+    controller = axis_pos(entry["controller"])
     actuator   = axis_pos(entry["actuator"])
+
+    # N DOF and environment remain continuous within their axes.
     ndof       = axis_pos(entry["ndof"])
     env        = axis_pos(entry["environment"])
 
     floor_point = project_point(controller, actuator, 0.0)
     real_point  = project_point(controller, actuator, env)
 
-    controller_axis_point = project_point(axis_pos(entry["controller"]), 0.0, 0.0)
+    controller_axis_point = project_point(controller, 0.0, 0.0)
 
     ndof_readout_start     = ORIGIN + CONTROLLER_VEC
     actuator_readout_start = ndof_readout_start - NDOF_OFFSET * CONTROLLER_VEC
 
-    # Apply actuator jitter only as movement along the lower Actuator axis.
-    # This prevents the endpoint from overshooting off the axis.
-    actuator_readout_coord = clip_01(entry["actuator"] + entry.get("actuator_axis_jitter", 0.0))
-    actuator_readout_point = actuator_readout_start + axis_pos(actuator_readout_coord) * EMBODIMENT_VEC
+    # Actuator projection stops exactly on the lower Actuator readout axis
+    # at the same discrete actuator tick used by the model itself.
+    actuator_readout_point = actuator_readout_start + actuator * EMBODIMENT_VEC
 
+    # N DOF projection points to the original N DOF axis and may fall between ticks.
     ndof_axis_point = NDOF_START + ndof * EMBODIMENT_VEC
 
     projection_style = {
@@ -395,7 +487,6 @@ def draw_model(ax, entry: dict) -> None:
         "zorder" : 2,
     }
 
-    # Exactly one projection per dimension.
     ax.plot(
         [controller_axis_point[0], floor_point[0]],
         [controller_axis_point[1], floor_point[1]],
@@ -437,17 +528,20 @@ def draw_model(ax, entry: dict) -> None:
 
     draw_sphere(ax, real_point[0], real_point[1], color=entry["color"])
 
-    ax.text(
+    text = ax.text(
         real_point[0] + entry["label_dx"],
         real_point[1] + entry["label_dy"],
         entry["label"],
-        fontsize   = 10.5,
+        fontsize   = 8.2,
         color      = entry["color"],
         fontweight = "bold" if entry["is_robot"] else "normal",
         ha         = "left",
         va         = "center",
+        bbox       = dict(facecolor="white", edgecolor="none", alpha=0.72, pad=0.15),
         zorder     = 13,
     )
+
+    return text
 
 
 # =============================================================================
@@ -618,14 +712,17 @@ def make_figure(models: list[dict] | None = None) -> plt.Figure:
     ax.set_ylim(*Y_LIMITS)
     ax.axis("off")
 
+    label_texts = []
     for entry in add_overlap_offsets(models):
-        draw_model(ax, entry)
+        label_texts.append(draw_model(ax, entry))
 
     draw_box_faces(ax)
     draw_box_edges(ax)
     draw_axes(ax)
     draw_axis_titles(ax)
     draw_axis_ticks_and_labels(ax)
+
+    relax_text_labels(fig, ax, label_texts)
 
     return fig
 
