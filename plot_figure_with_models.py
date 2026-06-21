@@ -1,23 +1,10 @@
-"""
-Plot neuromechanical model coordinates from an editable Excel workbook.
-
-Input workbook:
-    /mnt/data/neuromechanical_models_full_table_tickspace.xlsx
-
-Coordinate convention:
-    - workbook coordinates run from 0 to 1 between the first and last tick.
-    - the first and last ticks are offset inside the physical axis limits.
-    - each model receives exactly one projection to each of:
-      controller, actuator, and N DOF.
-"""
+"""Model plot with swapped N DOF/Actuator axes; data loaded with pandas."""
 
 from __future__ import annotations
 
-from collections import defaultdict
 from pathlib import Path
 
-from openpyxl import load_workbook
-
+import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import to_rgb
@@ -25,10 +12,8 @@ from matplotlib.patches import FancyArrowPatch, Polygon
 
 
 MODEL_XLSX = Path("models_data.xlsx")
-
-OUT_PNG = Path("figure_with_models.png")
-OUT_PDF = Path("figure_with_models.pdf")
-
+OUT_PNG    = Path("figure_with_models.png")
+OUT_PDF    = Path("figure_with_models.pdf")
 
 # =============================================================================
 # Style
@@ -62,7 +47,6 @@ SPHERE_ALPHA            = 0.65
 VERTICAL_LINE_ALPHA     = 0.65
 PROJECTION_ALPHA        = 0.78
 
-
 # =============================================================================
 # Geometry
 # =============================================================================
@@ -72,16 +56,21 @@ EMBODIMENT_VEC  = np.array([7.75, 0.00])
 CONTROLLER_VEC  = np.array([2.35, -2.66])
 ENVIRONMENT_VEC = np.array([0.00, 3.40])
 
-NDOF_OFFSET     = 0.08
-NDOF_START      = ORIGIN + NDOF_OFFSET * CONTROLLER_VEC
+MAIN_ACTUATOR_OFFSET = 0.06
+NDOF_START           = ORIGIN
+ACTUATOR_START       = ORIGIN + MAIN_ACTUATOR_OFFSET * CONTROLLER_VEC
+
+LOWER_NDOF_BACKOFFSET = 0.06
+LOWER_ACTUATOR_START  = ORIGIN + CONTROLLER_VEC
+LOWER_NDOF_START      = ORIGIN + (1.0 - LOWER_NDOF_BACKOFFSET) * CONTROLLER_VEC
 
 AXIS_TICK_START = 0.12
 AXIS_TICK_END   = 0.90
 
 FIGSIZE         = (12.2, 7.6)
 DPI             = 160
-X_LIMITS        = (0.0, 14.10)
-Y_LIMITS        = (-0.80, 7.10)
+X_LIMITS        = (0.0, 14.20)
+Y_LIMITS        = (-0.95, 7.15)
 
 
 def clip_01(value: float) -> float:
@@ -89,21 +78,13 @@ def clip_01(value: float) -> float:
 
 
 def axis_pos(coord: float) -> float:
-    """Map semantic coordinate 0..1 to an offset axis position."""
     return AXIS_TICK_START + clip_01(coord) * (AXIS_TICK_END - AXIS_TICK_START)
 
 
-def project_point(
-    controller  : float = 0.0,
-    embodiment  : float = 0.0,
-    environment : float = 0.0,
-) -> np.ndarray:
-    return (
-        ORIGIN
-        + controller  * CONTROLLER_VEC
-        + embodiment  * EMBODIMENT_VEC
-        + environment * ENVIRONMENT_VEC
-    )
+def project_point(controller: float = 0.0,
+                  embodiment: float = 0.0,
+                  environment: float = 0.0) -> np.ndarray:
+    return ORIGIN + controller * CONTROLLER_VEC + embodiment * EMBODIMENT_VEC + environment * ENVIRONMENT_VEC
 
 
 def unit_vector(vec: np.ndarray) -> np.ndarray:
@@ -112,7 +93,7 @@ def unit_vector(vec: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
-# Ticks - coordinates are semantic; draw locations use axis_pos(...)
+# Ticks
 # =============================================================================
 
 CONTROLLER_TICKS = [
@@ -146,98 +127,6 @@ NDOF_TICKS = [
     (1.00, "50+"),
 ]
 
-# Categorical equivalences. These are used only to snap models to the existing
-# original ticks; no new visible ticks are added.
-CONTROLLER_LEVEL_TO_COORD = {
-    "No controller"               : 0.00,
-    "Open-loop / FSM / oscillator": 0.25,
-    "Rate / leaky / CPG neural"   : 0.50,
-    "ANN / RL / torque policy"    : 0.50,
-    "Integrate-and-fire"          : 0.75,
-    "Hodgkin-Huxley"              : 1.00,
-}
-
-ACTUATOR_LEVEL_TO_COORD = {
-    "No actuator"               : 0.00,
-    "Servomotor / position"     : 0.25,
-    "DC motor / PD"             : 0.25,
-    "Torque control"            : 0.50,
-    "Ekeberg muscle"            : 0.75,
-    "Spring-damper muscle-like" : 0.75,
-    "Hill muscle"               : 1.00,
-}
-
-
-# =============================================================================
-# Data loading
-# =============================================================================
-
-def to_bool(value) -> bool:
-    return str(value).strip().lower() in {"yes", "true", "1", "y"}
-
-
-def to_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except ValueError:
-        return default
-
-
-def load_models(path: Path = MODEL_XLSX) -> list[dict]:
-    """Load model coordinates from the Models sheet.
-
-    Controller and actuator are discrete variables. Therefore, their plotted
-    positions are derived from controller_level and actuator_level and snapped
-    to the existing original ticks. The editable coordinate columns remain in
-    the workbook for transparency, but they do not create extra ticks.
-    """
-    wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb["Models"]
-
-    rows = list(ws.iter_rows(values_only=True))
-    headers = [str(value) for value in rows[0]]
-    index = {name: i for i, name in enumerate(headers)}
-
-    models = []
-    for raw in rows[1:]:
-        row = {name: raw[i] if i < len(raw) else None for name, i in index.items()}
-
-        if not to_bool(row.get("include_in_plot", "yes")):
-            continue
-
-        controller_level = str(row.get("controller_level", ""))
-        actuator_level   = str(row.get("actuator_level", ""))
-
-        controller_coord = CONTROLLER_LEVEL_TO_COORD.get(
-            controller_level,
-            to_float(row.get("controller_coord")),
-        )
-        actuator_coord = ACTUATOR_LEVEL_TO_COORD.get(
-            actuator_level,
-            to_float(row.get("actuator_coord")),
-        )
-
-        color = ROBOT_COLOR if row.get("plot_color") == "red" else MODEL_COLOR
-        models.append(
-            {
-                "label"            : str(row["plot_label"]),
-                "controller_level" : controller_level,
-                "actuator_level"   : actuator_level,
-                "is_robot"         : to_bool(row["is_robot"]),
-                "color"            : color,
-                "controller"       : controller_coord,
-                "actuator"         : actuator_coord,
-                "ndof"             : to_float(row["ndof_coord"]),
-                "environment"      : to_float(row["environment_coord"]),
-                "label_dx"         : to_float(row.get("label_dx"), 0.15),
-                "label_dy"         : to_float(row.get("label_dy"), 0.20),
-            }
-        )
-
-    return models
-
 
 # =============================================================================
 # Drawing utilities
@@ -248,27 +137,20 @@ def draw_arrow(ax, start: np.ndarray, vec: np.ndarray, color: str) -> None:
         FancyArrowPatch(
             tuple(start),
             tuple(start + vec),
-            arrowstyle     = "-|>",
-            mutation_scale = 14,
-            color          = color,
-            lw             = AXIS_LINEWIDTH,
-            shrinkA        = 0,
-            shrinkB        = 0,
-            zorder         = 10,
+            arrowstyle="-|>",
+            mutation_scale=14,
+            color=color,
+            lw=AXIS_LINEWIDTH,
+            shrinkA=0,
+            shrinkB=0,
+            zorder=10,
         )
     )
 
 
-def draw_tick(
-    ax,
-    axis_start: np.ndarray,
-    axis_vec: np.ndarray,
-    position: float,
-    color: str,
-    length: float = 0.16,
-    lw: float = 1.25,
-    zorder: int = 9,
-) -> np.ndarray:
+def draw_tick(ax, axis_start: np.ndarray, axis_vec: np.ndarray,
+              position: float, color: str, length: float = 0.16,
+              lw: float = 1.25, zorder: int = 9) -> np.ndarray:
     center = axis_start + position * axis_vec
     normal = unit_vector(np.array([-axis_vec[1], axis_vec[0]]))
     a = center - 0.5 * length * normal
@@ -279,14 +161,14 @@ def draw_tick(
 
 def box_vertices() -> dict[str, np.ndarray]:
     return {
-        "000" : ORIGIN,
-        "100" : ORIGIN + EMBODIMENT_VEC,
-        "010" : ORIGIN + CONTROLLER_VEC,
-        "110" : ORIGIN + EMBODIMENT_VEC + CONTROLLER_VEC,
-        "001" : ORIGIN + ENVIRONMENT_VEC,
-        "101" : ORIGIN + EMBODIMENT_VEC + ENVIRONMENT_VEC,
-        "011" : ORIGIN + CONTROLLER_VEC + ENVIRONMENT_VEC,
-        "111" : ORIGIN + EMBODIMENT_VEC + CONTROLLER_VEC + ENVIRONMENT_VEC,
+        "000": ORIGIN,
+        "100": ORIGIN + EMBODIMENT_VEC,
+        "010": ORIGIN + CONTROLLER_VEC,
+        "110": ORIGIN + EMBODIMENT_VEC + CONTROLLER_VEC,
+        "001": ORIGIN + ENVIRONMENT_VEC,
+        "101": ORIGIN + EMBODIMENT_VEC + ENVIRONMENT_VEC,
+        "011": ORIGIN + CONTROLLER_VEC + ENVIRONMENT_VEC,
+        "111": ORIGIN + EMBODIMENT_VEC + CONTROLLER_VEC + ENVIRONMENT_VEC,
     }
 
 
@@ -299,18 +181,9 @@ def draw_box_faces(ax) -> None:
         [v["100"], v["110"], v["111"], v["101"]],
         [v["001"], v["101"], v["111"], v["011"]],
     ]
-
     for face, alpha in zip(faces, [0.035, 0.035, 0.025, 0.025, 0.045]):
-        ax.add_patch(
-            Polygon(
-                face,
-                closed    = True,
-                facecolor = "white",
-                edgecolor = "none",
-                alpha     = alpha,
-                zorder    = 5,
-            )
-        )
+        ax.add_patch(Polygon(face, closed=True, facecolor="white",
+                             edgecolor="none", alpha=alpha, zorder=5))
 
 
 def draw_box_edges(ax) -> None:
@@ -320,28 +193,169 @@ def draw_box_edges(ax) -> None:
         ("001", "101"), ("101", "111"), ("111", "011"), ("011", "001"),
         ("000", "001"), ("100", "101"), ("010", "011"), ("110", "111"),
     ]
-
     for a, b in edges:
         p0, p1 = v[a], v[b]
-        ax.plot(
-            [p0[0], p1[0]],
-            [p0[1], p1[1]],
-            color  = BOX_COLOR,
-            lw     = BOX_LINEWIDTH,
-            ls     = (0, (4, 3)),
-            alpha  = 0.75,
-            zorder = 6,
+        ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                color=BOX_COLOR, lw=BOX_LINEWIDTH, ls=(0, (4, 3)),
+                alpha=0.75, zorder=6)
+
+
+def draw_axes(ax) -> None:
+    draw_arrow(ax, NDOF_START, EMBODIMENT_VEC, NDOF_COLOR)
+    draw_arrow(ax, ACTUATOR_START, EMBODIMENT_VEC, ACTUATOR_COLOR)
+    draw_arrow(ax, ORIGIN, CONTROLLER_VEC, CONTROLLER_COLOR)
+    draw_arrow(ax, ORIGIN, ENVIRONMENT_VEC, ENVIRONMENT_COLOR)
+
+
+def draw_axis_titles(ax) -> None:
+    ax.text(*(ORIGIN + ENVIRONMENT_VEC + np.array([-0.22, -0.00])),
+            "Richness of\nenvironment", ha="right", va="bottom",
+            fontsize=15.0, fontweight="bold", color=ENVIRONMENT_COLOR)
+
+    ax.text(*(ORIGIN + CONTROLLER_VEC + np.array([-1.50, -0.60])),
+            "Controller", ha="left", va="center",
+            fontsize=15.0, fontweight="bold", color=CONTROLLER_COLOR)
+
+    anchor = ORIGIN + EMBODIMENT_VEC + np.array([0.1, 0.85])
+    ax.text(*anchor, "Embodiment:", ha="left", va="center",
+            fontsize=14.2, fontweight="bold", color=MODEL_COLOR, zorder=13)
+    ax.text(*(anchor + np.array([0.0, -0.36])), "N DOF +",
+            ha="left", va="center", fontsize=14.2,
+            fontweight="bold", color=NDOF_COLOR, zorder=13)
+    ax.text(*(anchor + np.array([0.0, -0.72])), "Actuator",
+            ha="left", va="center", fontsize=14.2,
+            fontweight="bold", color=ACTUATOR_COLOR, zorder=13)
+
+
+def draw_environment_ticks(ax) -> None:
+    for coordinate, label in ENVIRONMENT_TICKS:
+        tick = draw_tick(ax, ORIGIN, ENVIRONMENT_VEC, axis_pos(coordinate), ENVIRONMENT_COLOR)
+        ax.text(tick[0] - 0.16, tick[1], label,
+                ha="right", va="center", fontsize=11.0, color=ENVIRONMENT_COLOR)
+
+
+def draw_controller_ticks(ax) -> None:
+    outside_normal = unit_vector(np.array([-CONTROLLER_VEC[1], CONTROLLER_VEC[0]]))
+    offsets = [0.12, 0.06, 0.00, -0.05, -0.10]
+    for (coordinate, label), dy in zip(CONTROLLER_TICKS, offsets):
+        tick = draw_tick(ax, ORIGIN, CONTROLLER_VEC, axis_pos(coordinate), CONTROLLER_COLOR)
+        label_position = tick - 0.36 * outside_normal + np.array([-0.05, dy])
+        ax.text(label_position[0], label_position[1], label,
+                ha="right", va="center", fontsize=8.3,
+                color=CONTROLLER_COLOR, zorder=13)
+
+
+def draw_embodiment_axis_ticks(ax) -> None:
+    for coordinate, _ in NDOF_TICKS:
+        draw_tick(ax, NDOF_START, EMBODIMENT_VEC, axis_pos(coordinate),
+                  NDOF_COLOR, length=0.14)
+    for coordinate, _ in ACTUATOR_TICKS:
+        draw_tick(ax, ACTUATOR_START, EMBODIMENT_VEC, axis_pos(coordinate),
+                  ACTUATOR_COLOR, length=0.15)
+
+
+def draw_readout_axes(ax) -> None:
+    for start, color in [(LOWER_NDOF_START, NDOF_COLOR),
+                         (LOWER_ACTUATOR_START, ACTUATOR_COLOR)]:
+        ax.plot([start[0], start[0] + EMBODIMENT_VEC[0]],
+                [start[1], start[1] + EMBODIMENT_VEC[1]],
+                color=color, lw=READOUT_AXIS_LINEWIDTH, zorder=8)
+
+    for coordinate, label in NDOF_TICKS:
+        tick = draw_tick(ax, LOWER_NDOF_START, EMBODIMENT_VEC,
+                         axis_pos(coordinate), NDOF_COLOR, length=0.14)
+        ax.text(tick[0], tick[1] + 0.16, label,
+                ha="center", va="bottom", fontsize=8.4,
+                color=NDOF_COLOR, zorder=13)
+
+    for coordinate, label in ACTUATOR_TICKS:
+        tick = draw_tick(ax, LOWER_ACTUATOR_START, EMBODIMENT_VEC,
+                         axis_pos(coordinate), ACTUATOR_COLOR, length=0.15)
+        ax.text(tick[0], tick[1] - 0.18, label,
+                ha="center", va="top", fontsize=8.0,
+                color=ACTUATOR_COLOR, zorder=13)
+
+
+def draw_axis_ticks_and_labels(ax) -> None:
+    draw_environment_ticks(ax)
+    draw_controller_ticks(ax)
+    draw_embodiment_axis_ticks(ax)
+    draw_readout_axes(ax)
+
+
+def setup_axes() -> tuple[plt.Figure, plt.Axes]:
+    fig, ax = plt.subplots(figsize=FIGSIZE, dpi=DPI)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(*X_LIMITS)
+    ax.set_ylim(*Y_LIMITS)
+    ax.axis("off")
+    return fig, ax
+
+def to_bool(value) -> bool:
+    return str(value).strip().lower() in {"yes", "true", "1", "y"}
+
+
+def load_models(path: Path = MODEL_XLSX) -> list[dict]:
+    """Load the model table with pandas."""
+    df = pd.read_excel(path, sheet_name="Models")
+    df = df[df["include_in_plot"].astype(str).str.lower().isin(["yes", "true", "1"])]
+
+    models = []
+    for _, row in df.iterrows():
+        models.append(
+            {
+                "label": str(row["plot_label"]),
+                "is_robot": to_bool(row["is_robot"]),
+                "color": ROBOT_COLOR if str(row["plot_color"]).lower() == "red" else MODEL_COLOR,
+                "controller_base": float(row["controller_coord"]),
+                "actuator": float(row["actuator_coord"]),
+                "ndof": float(row["ndof_coord"]),
+                "environment": float(row["environment_coord"]),
+                "complexity_score": float(row.get("complexity_score", 0.0)),
+                "label_dx": float(row.get("label_dx", 0.15)),
+                "label_dy": float(row.get("label_dy", 0.20)),
+            }
         )
+    return models
 
 
-def draw_sphere(
-    ax,
-    x: float,
-    y: float,
-    radius: float = 0.082,
-    color: str = MODEL_COLOR,
-    alpha: float = SPHERE_ALPHA,
-) -> None:
+def add_xy_offsets(entries: list[dict], max_offset: float = 0.10) -> list[dict]:
+    """Offset models with the same actuator/controller position along the controller axis.
+
+    The offset is only applied to the plotted model position. The controller
+    projection still returns to the original controller tick.
+    """
+    grouped: dict[tuple[float, float], list[int]] = {}
+    copied = [entry.copy() for entry in entries]
+
+    for i, entry in enumerate(copied):
+        key = (round(entry["controller_base"], 4), round(entry["actuator"], 4))
+        grouped.setdefault(key, []).append(i)
+
+    for indices in grouped.values():
+        if len(indices) == 1:
+            copied[indices[0]]["controller_plot"] = copied[indices[0]]["controller_base"]
+            continue
+
+        indices_sorted = sorted(indices, key=lambda i: copied[i]["complexity_score"])
+        n = len(indices_sorted)
+
+        # Simpler entries receive the smaller displacement, then progressively
+        # more complex entries move farther along the controller axis.
+        raw_offsets = np.linspace(0.0, max_offset, n)
+
+        base = copied[indices_sorted[0]]["controller_base"]
+        if base + raw_offsets[-1] > 1.0:
+            raw_offsets = raw_offsets - (base + raw_offsets[-1] - 1.0)
+
+        for idx, offset in zip(indices_sorted, raw_offsets):
+            copied[idx]["controller_plot"] = clip_01(copied[idx]["controller_base"] + float(offset))
+
+    return copied
+
+
+def draw_sphere(ax, x: float, y: float, radius: float = 0.1,
+                color: str = MODEL_COLOR, alpha: float = SPHERE_ALPHA) -> None:
     base_color = np.array(to_rgb(color))
     n_pixels = 90
     yy, xx = np.mgrid[-1:1:complex(n_pixels), -1:1:complex(n_pixels)]
@@ -365,48 +379,18 @@ def draw_sphere(
     rgba[:, :, :3] = rgb
     rgba[:, :, 3] = alpha * mask.astype(float) * (0.55 + 0.45 * rim)
 
-    ax.imshow(
-        rgba,
-        extent        = [x - radius, x + radius, y - radius, y + radius],
-        origin        = "lower",
-        interpolation = "bilinear",
-        zorder        = 12,
-    )
-
-
-# =============================================================================
-# Models and projections
-# =============================================================================
-
-def add_overlap_offsets(entries: list[dict]) -> list[dict]:
-    """Return entries unchanged.
-
-    Controller and actuator are discrete dimensions. Models sharing the same
-    actuator type must therefore sit on the same actuator coordinate. Label
-    overlap is handled only by moving text labels, not by jittering model data.
-    """
-    return [entry.copy() for entry in entries]
+    ax.imshow(rgba, extent=[x - radius, x + radius, y - radius, y + radius],
+              origin="lower", interpolation="bilinear", zorder=12)
 
 
 def data_delta_from_pixels(ax, dx: float, dy: float) -> np.ndarray:
-    """Convert a display-space shift in pixels into data coordinates."""
     inv = ax.transData.inverted()
     p0 = inv.transform((0, 0))
     p1 = inv.transform((dx, dy))
     return p1 - p0
 
 
-def relax_text_labels(
-    fig,
-    ax,
-    texts: list,
-    iterations: int = 220,
-    step_px: float = 6.0,
-) -> None:
-    """Iteratively separate overlapping model labels.
-
-    The model coordinates and projections are not moved.
-    """
+def relax_text_labels(fig, ax, texts: list, iterations: int = 240, step_px: float = 5.0) -> None:
     if not texts:
         return
 
@@ -414,9 +398,7 @@ def relax_text_labels(
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         moved = False
-
-        boxes = [text.get_window_extent(renderer=renderer).expanded(1.06, 1.12)
-                 for text in texts]
+        boxes = [t.get_window_extent(renderer=renderer).expanded(1.06, 1.14) for t in texts]
 
         for i in range(len(texts)):
             for j in range(i + 1, len(texts)):
@@ -427,28 +409,16 @@ def relax_text_labels(
                 cj = boxes[j].get_points().mean(axis=0)
                 direction = ci - cj
                 norm = np.linalg.norm(direction)
-
-                if norm == 0:
-                    direction = np.array([0.0, 1.0])
-                else:
-                    direction = direction / norm
-
-                direction = direction + np.array([0.18, 0.10])
+                direction = direction / norm if norm else np.array([0.0, 1.0])
+                direction = direction + np.array([0.20, 0.12])
                 norm = np.linalg.norm(direction)
                 direction = direction / norm if norm else direction
 
-                delta = data_delta_from_pixels(
-                    ax,
-                    step_px * direction[0],
-                    step_px * direction[1],
-                )
-
+                delta = data_delta_from_pixels(ax, step_px * direction[0], step_px * direction[1])
                 xi, yi = texts[i].get_position()
                 xj, yj = texts[j].get_position()
-
                 texts[i].set_position((xi + delta[0], yi + delta[1]))
                 texts[j].set_position((xj - delta[0], yj - delta[1]))
-
                 moved = True
 
         if not moved:
@@ -456,75 +426,56 @@ def relax_text_labels(
 
 
 def draw_model(ax, entry: dict):
-    """Draw one model and exactly three horizontal projections."""
-    # Controller and actuator snap exactly to original discrete tick coordinates.
-    controller = axis_pos(entry["controller"])
-    actuator   = axis_pos(entry["actuator"])
+    controller_plot = axis_pos(entry["controller_plot"])
+    controller_base = axis_pos(entry["controller_base"])
+    actuator = axis_pos(entry["actuator"])
+    ndof = axis_pos(entry["ndof"])
+    env = axis_pos(entry["environment"])
 
-    # N DOF and environment remain continuous within their axes.
-    ndof       = axis_pos(entry["ndof"])
-    env        = axis_pos(entry["environment"])
+    # Model x-position follows discrete actuator type.
+    floor_point = project_point(controller_plot, actuator, 0.0)
+    real_point = project_point(controller_plot, actuator, env)
 
-    floor_point = project_point(controller, actuator, 0.0)
-    real_point  = project_point(controller, actuator, env)
+    # Projection to original controller tick, not to the offset model position.
+    controller_axis_point = project_point(controller_base, 0.0, 0.0)
 
-    controller_axis_point = project_point(controller, 0.0, 0.0)
+    # Actuator projection to upper/main Actuator axis.
+    actuator_axis_point = ACTUATOR_START + actuator * EMBODIMENT_VEC
 
-    ndof_readout_start     = ORIGIN + CONTROLLER_VEC
-    actuator_readout_start = ndof_readout_start - NDOF_OFFSET * CONTROLLER_VEC
+    # N DOF projection to lower/secondary N DOF axis.
+    ndof_axis_point = LOWER_NDOF_START + ndof * EMBODIMENT_VEC
 
-    # Actuator projection stops exactly on the lower Actuator readout axis
-    # at the same discrete actuator tick used by the model itself.
-    actuator_readout_point = actuator_readout_start + actuator * EMBODIMENT_VEC
-
-    # N DOF projection points to the original N DOF axis and may fall between ticks.
-    ndof_axis_point = NDOF_START + ndof * EMBODIMENT_VEC
-
-    projection_style = {
-        "lw"     : PROJECTION_LINEWIDTH,
-        "ls"     : (0, (1.2, 2.5)),
-        "alpha"  : PROJECTION_ALPHA,
-        "zorder" : 2,
+    proj_style = {
+        "lw": PROJECTION_LINEWIDTH,
+        "ls": (0, (1.2, 2.5)),
+        "alpha": PROJECTION_ALPHA,
+        "zorder": 2,
     }
 
-    ax.plot(
-        [controller_axis_point[0], floor_point[0]],
-        [controller_axis_point[1], floor_point[1]],
-        color = CONTROLLER_COLOR,
-        **projection_style,
-    )
-    ax.plot(
-        [actuator_readout_point[0], floor_point[0]],
-        [actuator_readout_point[1], floor_point[1]],
-        color = ACTUATOR_COLOR,
-        **projection_style,
-    )
-    ax.plot(
-        [ndof_axis_point[0], floor_point[0]],
-        [ndof_axis_point[1], floor_point[1]],
-        color = NDOF_COLOR,
-        **projection_style,
-    )
+    # Controller projections
+    proj_c_alpha = PROJECTION_ALPHA
+    ax.plot([controller_axis_point[0], floor_point[0]],
+            [controller_axis_point[1], floor_point[1]],
+            color=CONTROLLER_COLOR, **{**proj_style, "alpha": proj_c_alpha})
+    # Actuator projections
+    proj_a_alpha = 0.0
+    ax.plot([actuator_axis_point[0], floor_point[0]],
+            [actuator_axis_point[1], floor_point[1]],
+            color=ACTUATOR_COLOR, **{**proj_style, "alpha": proj_a_alpha})
+    # N DOF projections
+    proj_n_alpha = PROJECTION_ALPHA
+    ax.plot([ndof_axis_point[0], floor_point[0]],
+            [ndof_axis_point[1], floor_point[1]],
+            color=NDOF_COLOR, **{**proj_style, "alpha": proj_n_alpha})
 
-    ax.plot(
-        [floor_point[0], real_point[0]],
-        [floor_point[1], real_point[1]],
-        color  = ENVIRONMENT_COLOR,
-        lw     = VERTICAL_LINEWIDTH,
-        alpha  = VERTICAL_LINE_ALPHA,
-        zorder = 4,
-    )
+    ax.plot([floor_point[0], real_point[0]],
+            [floor_point[1], real_point[1]],
+            color=ENVIRONMENT_COLOR, lw=VERTICAL_LINEWIDTH,
+            alpha=VERTICAL_LINE_ALPHA, zorder=4)
 
-    ax.scatter(
-        [floor_point[0]],
-        [floor_point[1]],
-        marker    = "D",
-        s         = 28,
-        facecolor = "white",
-        edgecolor = entry["color"],
-        linewidth = 1.05,
-        zorder    = 9,
-    )
+    ax.scatter([floor_point[0]], [floor_point[1]], marker="D", s=8,
+               facecolor="white", edgecolor=entry["color"],
+               linewidth=1.05, zorder=9)
 
     draw_sphere(ax, real_point[0], real_point[1], color=entry["color"])
 
@@ -532,197 +483,32 @@ def draw_model(ax, entry: dict):
         real_point[0] + entry["label_dx"],
         real_point[1] + entry["label_dy"],
         entry["label"],
-        fontsize   = 8.2,
-        color      = entry["color"],
-        fontweight = "bold" if entry["is_robot"] else "normal",
-        ha         = "left",
-        va         = "center",
-        bbox       = dict(facecolor="white", edgecolor="none", alpha=0.72, pad=0.15),
-        zorder     = 13,
+        fontsize=8.1,
+        color=entry["color"],
+        fontweight="bold" if entry["is_robot"] else "normal",
+        ha="left",
+        va="center",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.74, pad=0.15),
+        zorder=13,
     )
-
     return text
 
 
-# =============================================================================
-# Axes and labels
-# =============================================================================
-
-def draw_axes(ax) -> None:
-    draw_arrow(ax, ORIGIN,     EMBODIMENT_VEC,  ACTUATOR_COLOR)
-    draw_arrow(ax, NDOF_START, EMBODIMENT_VEC,  NDOF_COLOR)
-    draw_arrow(ax, ORIGIN,     CONTROLLER_VEC,  CONTROLLER_COLOR)
-    draw_arrow(ax, ORIGIN,     ENVIRONMENT_VEC, ENVIRONMENT_COLOR)
-
-
-def draw_axis_titles(ax) -> None:
-    ax.text(
-        *(ORIGIN + ENVIRONMENT_VEC + np.array([-0.22, -0.20])),
-        "Richness of\nenvironment",
-        ha         = "right",
-        va         = "bottom",
-        fontsize   = 15.0,
-        fontweight = "bold",
-        color      = ENVIRONMENT_COLOR,
-    )
-
-    ax.text(
-        *(ORIGIN + CONTROLLER_VEC + np.array([-1.20, -0.60])),
-        "Controller",
-        ha         = "left",
-        va         = "center",
-        fontsize   = 15.0,
-        fontweight = "bold",
-        color      = CONTROLLER_COLOR,
-    )
-
-    # Three-line Embodiment title, shifted far right to avoid model labels.
-    anchor = ORIGIN + EMBODIMENT_VEC + np.array([1.25, 0.90])
-
-    ax.text(
-        *anchor,
-        "Embodiment:",
-        ha         = "left",
-        va         = "center",
-        fontsize   = 14.2,
-        fontweight = "bold",
-        color      = MODEL_COLOR,
-        zorder     = 13,
-    )
-    ax.text(
-        *(anchor + np.array([0.0, -0.36])),
-        "Actuator",
-        ha         = "left",
-        va         = "center",
-        fontsize   = 14.2,
-        fontweight = "bold",
-        color      = ACTUATOR_COLOR,
-        zorder     = 13,
-    )
-    ax.text(
-        *(anchor + np.array([0.0, -0.72])),
-        "N DOF",
-        ha         = "left",
-        va         = "center",
-        fontsize   = 14.2,
-        fontweight = "bold",
-        color      = NDOF_COLOR,
-        zorder     = 13,
-    )
-
-
-def draw_environment_ticks(ax) -> None:
-    for coordinate, label in ENVIRONMENT_TICKS:
-        tick = draw_tick(ax, ORIGIN, ENVIRONMENT_VEC, axis_pos(coordinate), ENVIRONMENT_COLOR)
-        ax.text(
-            tick[0] - 0.16,
-            tick[1],
-            label,
-            ha       = "right",
-            va       = "center",
-            fontsize = 11.0,
-            color    = ENVIRONMENT_COLOR,
-        )
-
-
-def draw_controller_ticks(ax) -> None:
-    outside_normal = unit_vector(np.array([-CONTROLLER_VEC[1], CONTROLLER_VEC[0]]))
-    offsets = [0.12, 0.06, 0.00, -0.05, -0.10]
-    for (coordinate, label), dy in zip(CONTROLLER_TICKS, offsets):
-        tick = draw_tick(ax, ORIGIN, CONTROLLER_VEC, axis_pos(coordinate), CONTROLLER_COLOR)
-        label_position = tick - 0.36 * outside_normal + np.array([-0.05, dy])
-        ax.text(
-            label_position[0],
-            label_position[1],
-            label,
-            ha       = "right",
-            va       = "center",
-            fontsize = 8.3,
-            color    = CONTROLLER_COLOR,
-            zorder   = 13,
-        )
-
-
-def draw_embodiment_axis_ticks(ax) -> None:
-    for coordinate, _ in ACTUATOR_TICKS:
-        draw_tick(ax, ORIGIN, EMBODIMENT_VEC, axis_pos(coordinate), ACTUATOR_COLOR, length=0.15)
-    for coordinate, _ in NDOF_TICKS:
-        draw_tick(ax, NDOF_START, EMBODIMENT_VEC, axis_pos(coordinate), NDOF_COLOR, length=0.14)
-
-
-def draw_readout_axes(ax) -> None:
-    ndof_start     = ORIGIN + CONTROLLER_VEC
-    actuator_start = ndof_start - NDOF_OFFSET * CONTROLLER_VEC
-
-    for start, color in [(actuator_start, ACTUATOR_COLOR), (ndof_start, NDOF_COLOR)]:
-        ax.plot(
-            [start[0], start[0] + EMBODIMENT_VEC[0]],
-            [start[1], start[1] + EMBODIMENT_VEC[1]],
-            color  = color,
-            lw     = READOUT_AXIS_LINEWIDTH,
-            zorder = 8,
-        )
-
-    for coordinate, label in ACTUATOR_TICKS:
-        tick = draw_tick(ax, actuator_start, EMBODIMENT_VEC, axis_pos(coordinate), ACTUATOR_COLOR, length=0.15)
-        ax.text(
-            tick[0],
-            tick[1] + 0.18,
-            label,
-            ha       = "center",
-            va       = "bottom",
-            fontsize = 8.1,
-            color    = ACTUATOR_COLOR,
-            zorder   = 13,
-        )
-
-    for coordinate, label in NDOF_TICKS:
-        tick = draw_tick(ax, ndof_start, EMBODIMENT_VEC, axis_pos(coordinate), NDOF_COLOR, length=0.14)
-        ax.text(
-            tick[0],
-            tick[1] - 0.18,
-            label,
-            ha       = "center",
-            va       = "top",
-            fontsize = 8.4,
-            color    = NDOF_COLOR,
-            zorder   = 13,
-        )
-
-
-def draw_axis_ticks_and_labels(ax) -> None:
-    draw_environment_ticks(ax)
-    draw_controller_ticks(ax)
-    draw_embodiment_axis_ticks(ax)
-    draw_readout_axes(ax)
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
 def make_figure(models: list[dict] | None = None) -> plt.Figure:
     if models is None:
-        models = load_models()
+        models = add_xy_offsets(load_models())
 
-    fig, ax = plt.subplots(figsize=FIGSIZE, dpi=DPI)
-
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlim(*X_LIMITS)
-    ax.set_ylim(*Y_LIMITS)
-    ax.axis("off")
-
-    label_texts = []
-    for entry in add_overlap_offsets(models):
-        label_texts.append(draw_model(ax, entry))
+    fig, ax = setup_axes()
+    texts = []
+    for entry in models:
+        texts.append(draw_model(ax, entry))
 
     draw_box_faces(ax)
     draw_box_edges(ax)
     draw_axes(ax)
     draw_axis_titles(ax)
     draw_axis_ticks_and_labels(ax)
-
-    relax_text_labels(fig, ax, label_texts)
+    relax_text_labels(fig, ax, texts)
 
     return fig
 
